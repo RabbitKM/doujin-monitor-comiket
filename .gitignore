@@ -1,0 +1,6 @@
+state.json
+logs/
+*.log
+.env
+.claude/
+__pycache__/
