@@ -177,6 +177,18 @@ def is_reg_ended(reg_end_str: str) -> bool:
     return False
 
 
+def is_reg_started(reg_start_str: str) -> bool:
+    """判斷申込受付開始日是否已到（尚未到則回傳 False，代表日期已公告但還沒開放）。"""
+    m = re.search(r'(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日', reg_start_str)
+    if m:
+        try:
+            d = date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            return d <= date.today()
+        except Exception:
+            pass
+    return False
+
+
 def load_state() -> dict:
     if STATE_FILE.exists():
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -217,25 +229,36 @@ def send_discord_schedule(cno: str, event_date: str, tentative_date: str):
 
 
 def send_discord_appset(cno: str, event_date: str, reg_start: str, reg_end: str):
-    """🎉 報名開始通知（appset 階段）"""
+    """🎉/📅 報名日期通知（appset 階段）。依受付開始日是否已到選擇不同標題文字。"""
     if not DISCORD_WEBHOOK_URL:
         return
     now_str = datetime.now().strftime("%Y/%m/%d %H:%M")
     appset_url = APPSET_URL.format(cno=cno)
+
+    if is_reg_started(reg_start):
+        title = f"🎉 Comiket · {cno} 報名開始！"
+        lead  = f"**{cno}** 的社團報名已開始，快去確認！"
+        color = 0x7F77DD
+    else:
+        # 日期已公告，但受付開始日尚未到——避免文字誤導成「已經可以報名」
+        title = f"📅 Comiket · {cno} 報名日期公告！"
+        lead  = f"**{cno}** 的社團報名日期已公告，尚未開放受理，記得屆時再送出申込！"
+        color = 0x5B9BD5
+
     payload = {
         "username": "Comiket 報名小助手",
         "avatar_url": "https://www.comiket.co.jp/top/img/logo.gif",
         "embeds": [{
-            "title": f"🎉 Comiket · {cno} 報名開始！",
+            "title": title,
             "description": (
-                f"**{cno}** 的社團報名已開始，快去確認！\n\n"
+                f"{lead}\n\n"
                 f"🗓️ **活動日期**：{event_date}\n"
                 f"📅 **報名開始**：{reg_start}\n"
                 f"⏰ **報名截止**：{reg_end}\n\n"
                 f"[➡️ 前往報名頁面]({appset_url})\n"
                 f"[🌐 前往官網確認]({MAIN_URL})"
             ),
-            "color": 0x7F77DD,
+            "color": color,
             "footer": {"text": f"偵測時間：{now_str}"},
         }],
     }
@@ -296,9 +319,11 @@ def send_discord_heartbeat(events: dict):
         if status == "appset":
             reg_s = info.get("reg_start", "—")
             reg_e = info.get("reg_end", "—")
-            reg_e_display = f"⚠️ **{reg_e}（報名已截止）**" if is_reg_ended(reg_e) else reg_e
+            # 尚未截止：粗體＋⚠️ 醒目提醒即將截止；已截止：恢復一般文字，但保留「已截止」註記
+            reg_e_display = f"{reg_e}（報名已截止）" if is_reg_ended(reg_e) else f"⚠️ **{reg_e}**"
+            not_started_tag = " ⏳（尚未開始）" if not is_reg_started(reg_s) else ""
             line = (
-                f"**{cno}**{ended_tag}\n"
+                f"**{cno}**{ended_tag}{not_started_tag}\n"
                 f"　活動日期：{ev_date}\n"
                 f"　報名開始：{reg_s}\n"
                 f"　報名截止：{reg_e_display}"
@@ -394,21 +419,29 @@ def main():
         # 3a. 檢查 Appset 頁（優先）
         appset_ok, appset_html = fetch_url(APPSET_URL.format(cno=cno))
         if appset_ok == 200:
-            if entry["status"] != "appset":
-                # 狀態升級 → 解析日期並通知
+            had_dates = entry["reg_start"] != "—" and entry["reg_end"] != "—"
+
+            if not had_dates:
+                # 日期尚未確認過：每次都重新嘗試解析
+                # （頁面可能先建立、報名日期晚點才公告，不能只解析一次就鎖死）
                 dates = parse_appset_dates(appset_html)
                 entry["reg_start"] = dates["reg_start"]
                 entry["reg_end"]   = dates["reg_end"]
-                entry["status"]    = "appset"
+                now_has_dates = entry["reg_start"] != "—" and entry["reg_end"] != "—"
 
-                if cno in previous:
-                    # 已追蹤過的屆次：發大通知
-                    print(f"[申込開始] {cno}：{dates['reg_start']}")
-                    send_discord_appset(
-                        cno, event_date, dates["reg_start"], dates["reg_end"]
-                    )
+                if now_has_dates:
+                    entry["status"] = "appset"
+                    if cno in previous:
+                        # 已追蹤過的屆次：發大通知
+                        print(f"[申込開始] {cno}：{entry['reg_start']}")
+                        send_discord_appset(
+                            cno, event_date, entry["reg_start"], entry["reg_end"]
+                        )
+                    else:
+                        print(f"[首次記錄・已申込開始] {cno}")
                 else:
-                    print(f"[首次記錄・已申込開始] {cno}")
+                    # 頁面已建立但日期尚未公告：不升級狀態、不發通知，隔天自動重試
+                    print(f"[維持] {cno}：頁面已建立，日期尚未公告")
             else:
                 print(f"[維持] {cno}：申込受付中")
             current[cno] = entry

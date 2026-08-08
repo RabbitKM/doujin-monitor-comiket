@@ -4,3 +4,5 @@ logs/
 .env
 .claude/
 __pycache__/
+.mcp.json
+.playwright-mcp/
